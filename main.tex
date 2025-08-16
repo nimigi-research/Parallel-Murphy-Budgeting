@@ -1,0 +1,193 @@
+% main.tex — Parallel Murphy Budgeting (PMB)
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm, mathtools}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{xcolor}
+
+\title{Parallel Murphy Budgeting (PMB):\\
+Minimizing Time-to-Rare-Event Under Blocked-Geometric ``Murphy Clocks''}
+\author{Working Draft}
+\date{\today}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{lemma}{Lemma}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\1}{\mathbf{1}}
+\newcommand{\R}{\mathbb{R}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We study how to allocate $M$ parallel threads across $n$ targets to minimize the wall-clock time until a rare event is observed. Each target $i$ admits a blocked-geometric minorization: over a block of length $t_i^\star$, an individual thread succeeds with probability $p_i\in(0,1)$, independently across blocks. Assigning $m_i$ threads to target $i$ yields per-block success probability $q_i(m_i)=1-(1-p_i)^{m_i}$. In the rare-event regime ($q_i(m_i)\ll 1$), the hitting time on each target is well-approximated by an exponential with rate $\lambda_i(m_i)= \frac{-\log(1-q_i(m_i))}{t_i^\star}$. Because $1-q_i(m_i)=(1-p_i)^{m_i}$, this collapses to a linear hazard-per-time model $\lambda_i(m_i)=m_i c_i$ with $c_i:=\frac{-\log(1-p_i)}{t_i^\star}\approx\frac{p_i}{t_i^\star}$ (geometric $\to$ exponential scaling is standard\cite{Durrett2019,Ross2014}). The minimum across targets then has rate $\Lambda(m)=\sum_i m_i c_i$, giving $\E[T_{\min}]\approx 1/\Lambda(m)$ (min-of-exponentials property\cite{Durrett2019,Ross2014}). A key consequence is that in the ideal independent-thread regime, the optimal allocation is an index policy: concentrate all threads on the target(s) with maximal $c_i$; water-filling does not arise. Water-filling reappears when within-target returns are concave (e.g., correlated chains, resource contention), in which case KKT conditions equalize marginal gains and lead to $m_i^\*\propto a_i^{1/(1-\gamma)}$ for a rate model $\lambda_i(m)=a_i m^\gamma$ with $\gamma\in(0,1)$\cite{BoydVandenberghe2004,IbarakiKatoh1988}. We unify the offline allocator, the first-$K$ variants (including the distinct-targets case with reassignment), and an online hazard-UCB/Thompson-sampling scheduler\cite{Auer2002,AgrawalGoyal2012,GarivierCappe2011}. We provide practical guidance (integer rounding, caps, switching overhead, robustness to minorization error) and a minimal experiment plan.
+\end{abstract}
+
+\section{Introduction}
+Many search/eval/ops workflows face several \emph{rare} targets and a fixed budget of $M$ parallel workers (threads, seeds, simulators). Which targets get how many workers to minimize ``time until something interesting happens''? We formalize a pragmatic \emph{Murphy clock} model and derive an allocation rule that is simple, data-driven, and deployable: compute a per-target hazard-per-time $c_i$ and concentrate on the largest. We then show how \emph{water-filling} emerges if parallelism within a target is sublinear due to correlation or contention, and we give an online learning rule that estimates $p_i$ and allocates by an optimistic hazard index\cite{Auer2002,AgrawalGoyal2012,GarivierCappe2011}.
+
+\paragraph{Contributions.}
+(i) A clear hazard-index derivation for time-to-first rare event across multiple targets; (ii) an optimal sequential schedule for $K$ distinct hits with instantaneous reassignment; (iii) a principled route to water-filling via concave within-target returns with a recipe to estimate the sublinearity exponent; (iv) a unified online estimator and UCB/TS index; and (v) practical guidance (rounding, caps, overhead, robustness) with a small synthetic test plan.
+
+\section{Model}
+We have $n$ targets and $M$ threads. Each target $i$ has a block length $t_i^\star>0$ and a per-thread per-block success probability $p_i\in(0,1)$. With $m_i\in\{0,1,2,\ldots\}$ threads assigned to target $i$, the probability of at least one success in a block is
+\begin{equation}
+q_i(m_i) = 1-(1-p_i)^{m_i}.
+\end{equation}
+Let $B_i$ be the number of blocks until success on target $i$; $B_i\sim\mathrm{Geom}(q_i(m_i))$ on $\{1,2,\ldots\}$, so $\E[B_i]=1/q_i(m_i)$. The wall-clock hitting time for target $i$ alone is $T_i = t_i^\star B_i$. We care about the global first hit $T_{\min}=\min_i T_i$ and, more generally, the time to the $K$-th hit.
+
+\paragraph{Rare-event survival proxy.}
+For $q_i(m_i)\ll 1$, the survival function of $T_i$ admits the approximation
+\begin{equation}
+\Pr(T_i>t) \approx \exp\{-\lambda_i(m_i)\,t\},\qquad
+\lambda_i(m_i)=\frac{-\log(1-q_i(m_i))}{t_i^\star}
+=\frac{-\log\big((1-p_i)^{m_i}\big)}{t_i^\star}= m_i\,c_i,
+\end{equation}
+where
+\begin{equation}
+c_i := \frac{-\log(1-p_i)}{t_i^\star}\approx \frac{p_i}{t_i^\star}\quad\text{for }p_i\ll 1.
+\end{equation}
+This is the usual geometric-to-exponential scaling and the minimum-of-exponentials reduction\cite{Durrett2019,Ross2014}.
+
+\begin{proposition}[Hazard aggregation]
+\label{prop:haz}
+Assuming independence across targets and $\min_i t_i^\star \ll \E[T_{\min}]$, the time to first hit is approximately exponential with rate $\Lambda(m)=\sum_i \lambda_i(m_i)=\sum_i m_i c_i$. Hence
+\begin{equation}
+\label{eq:objective}
+\E[T_{\min}] \approx \frac{1}{\sum_{i=1}^n m_i c_i}.
+\end{equation}
+\end{proposition}
+
+\begin{proof}[Proof sketch]
+Each $i$ contributes an (approximate) exponential with rate $\lambda_i(m_i)$; the minimum of independent exponentials is exponential with rate equal to the sum\cite{Durrett2019,Ross2014}.
+\end{proof}
+
+\section{Consequences for Allocation}
+We impose the budget $\sum_i m_i=M$, $m_i\in\mathbb{Z}_{\ge 0}$.
+
+\subsection*{C1 (Index policy for $K{=}1$)}
+Maximizing $\sum_i m_i c_i$ over integer $m_i$ with a linear objective yields
+\begin{equation}
+m_i^\star \in \arg\max_{m:\,\sum m_i=M} \sum_i m_i c_i
+\;\Rightarrow\;
+m_i^\star=M\cdot \1\{i\in\arg\max_j c_j\}.
+\end{equation}
+Ties can be broken arbitrarily across maximizers; any split among top-$c_i$ targets is optimal. Water-filling is \emph{not} optimal under the independent-thread model.
+
+\subsection*{C2 (First $K$ total hits)}
+Under the same approximation, the combined hit process is approximately Poisson with rate $\Lambda(m)$. The time to $K$ total hits is Erlang with mean
+\begin{equation}
+\E[T_{K}] \approx \frac{K}{\sum_i m_i c_i},
+\end{equation}
+so the same index rule applies\cite{Ross2014}.
+
+\subsection*{C2$^\prime$ (First $K$ \emph{distinct} targets with reassignment)}
+Suppose a target is needed at most once and we can reassign threads instantaneously after a hit.
+\begin{proposition}[Sequential elimination is optimal in expectation]
+\label{prop:seq}
+Let $c_{(1)}\ge c_{(2)}\ge \cdots$ be the sorted hazards. The dynamic policy that allocates all $M$ threads to the current best remaining target until it hits, then removes it and repeats, achieves
+\begin{equation}
+\E[T_{K}^{\text{distinct}}] \approx \sum_{j=1}^K \frac{1}{M\,c_{(j)}},
+\end{equation}
+and is optimal among policies that may reassign after each hit (under the rare-event approximation, by memorylessness\cite{Ross2014}).
+\end{proposition}
+
+\section{When water-filling \emph{does} appear}
+In practice, returns to within-target parallelism can be sublinear due to correlation or contention. Model the effective rate as
+\begin{equation}
+\lambda_i(m_i) = a_i\,\phi_i(m_i),\qquad a_i>0,\ \ \phi_i\text{ increasing, concave},\ \ \phi_i(0)=0.
+\end{equation}
+\begin{proposition}[Water-filling via concavity]
+\label{prop:waterfill}
+Maximizing $\sum_i \lambda_i(m_i)$ subject to $\sum_i m_i=M$ and $m_i\ge 0$ yields KKT conditions that equalize marginal gains $\partial\lambda_i/\partial m_i$ across active targets. For $\phi_i(m)=m^\gamma$ with $\gamma\in(0,1)$,
+\begin{equation}
+m_i^\* \propto a_i^{\frac{1}{1-\gamma}}.
+\end{equation}
+\end{proposition}
+See standard convex-optimization recipes for separable concave resource allocation\cite{BoydVandenberghe2004,IbarakiKatoh1988}.
+
+\section{Practicalities}
+\paragraph{Integer rounding and caps.}
+If $0\le m_i\le u_i$, the greedy procedure ``repeatedly assign a thread to the arm with the largest \emph{current} marginal gain $\Delta\lambda_i$'' recovers the optimal integer allocation for separable concave $\lambda_i$ by selecting the top $M$ marginal increments\cite{IbarakiKatoh1988}.
+
+\paragraph{Switching overhead.}
+If reallocation costs $\delta$ time units, the sequential policy for distinct targets remains good as long as $\delta \ll 1/(M \max_i c_i)$. Otherwise keep a small insurance allocation on runner-ups to amortize warm-up.
+
+\paragraph{Robustness to minorization error.}
+If block-independence fails or heavy tails appear, estimate an empirical log-survival slope at the block scale,
+\begin{equation}
+\hat\lambda_i = -\frac{1}{t_i^\star}\log \hat S_i(t_i^\star),
+\end{equation}
+and plug into the same allocator; performance degrades gracefully. (When available, Doeblin/mixing-based clocks from the companion σ-Safety paper provide principled $t_i^\star, p_i$ inputs\cite{MeynTweedie2009}.)
+
+\section{Adaptive estimation and scheduling}
+Maintain Beta$(\alpha_0,\beta_0)$ posteriors over $p_i$. If per-thread outcomes are available, each completed block on target $i$ contributes $m_i$ Bernoulli trials. If only block-level indicators (``$\ge 1$ success'') are available, estimate $\hat q_i$ then invert $\hat p_i=1-(1-\hat q_i)^{1/m_i}$.
+
+\paragraph{Hazard-UCB (static budget).}
+At each assignment step $s=1,\ldots,M$, compute an optimistic index
+\begin{equation}
+c_i^+ = \frac{-\log\big(1-\mathrm{UCB}_i\big)}{t_i^\star},\qquad
+\mathrm{UCB}_i=\min\left\{1,\;\hat p_i+\sqrt{\frac{\alpha\log N}{2 n_i}}\right\},
+\end{equation}
+where $n_i$ is the effective number of Bernoulli samples for target $i$, $N=\sum_i n_i$, and $\alpha\ge1$. Assign the next thread to $i^\*\in\arg\max_i c_i^+$. Thompson sampling is a practical alternative: sample $p_i^{(s)}\sim \mathrm{Beta}$, compute $c_i^{(s)}$, and allocate to $\arg\max_i c_i^{(s)}$\cite{Auer2002,AgrawalGoyal2012,GarivierCappe2011}. Under stationarity, both concentrate on $\arg\max_i c_i$.
+
+\paragraph{Variance of the block-inversion estimator.}
+If $\hat q_i$ is estimated from $N$ blocks with variance $\mathrm{Var}(\hat q_i)=q_i(1-q_i)/N$, then $\hat p_i = g(\hat q_i)$ with $g(q)=1-(1-q)^{1/m_i}$ has derivative $g'(q)=(1/m_i)(1-q)^{1/m_i-1}$, so by the delta method
+\begin{equation}
+\mathrm{Var}(\hat p_i)\approx \frac{q_i(1-q_i)}{N\,m_i^2}\,(1-q_i)^{2(1/m_i-1)}.
+\end{equation}
+
+\section{Micro-example}
+Three targets: $(p_i,t_i^\star)=(10^{-3},20),(3\cdot10^{-4},6),(8\cdot10^{-4},50)$, and $M=16$. Compute $c_i = -\log(1-p_i)/t_i^\star \approx (5.0025,\,5.0008,\,1.6006)\times 10^{-5}$. Any allocation across the first two is essentially tied; placing mass on the third is dominated.
+\begin{align*}
+\E[T_{\min}] &\approx \frac{1}{\sum_i m_i c_i},\\
+m=(16,0,0):\; &\E[T_{\min}]\approx \frac{1}{16\cdot 5.0025\times 10^{-5}}\approx 1.249\times 10^3,\\
+m=(8,8,0):\; &\E[T_{\min}]\approx \frac{1}{8(5.0025+5.0008)\times 10^{-5}}\approx 1.250\times 10^3,\\
+m=(6,6,4):\; &\E[T_{\min}]\approx \frac{1}{\big(6(5.0025+5.0008)+4\cdot 1.6006\big)\times 10^{-5}}\approx 1.506\times 10^3.
+\end{align*}
+Thus the square-root split is strictly worse than concentrating on the top hazards in this regime.
+
+\section{Experiments (plan)}
+\begin{enumerate}[leftmargin=*, itemsep=2pt]
+\item \textbf{Synthetic rare-event playground.} Compare four strategies: even split; $\sqrt{\cdot}$ water-filling; hazard-index greedy; adaptive UCB/TS. Report mean/median time-to-first hit vs.\ $M$ and vs.\ correlation exponent $\gamma$ (generate $\lambda_i(m)=a_i m^\gamma$).
+\item \textbf{Domain sim.} Instantiate targets with distinct $(p_i,t_i^\star)$ from an application (e.g., different rare behaviors/events). Measure wall-time reduction at fixed $M$; sensitivity to mis-specification.
+\item \textbf{Robustness.} Vary within-target correlation to validate the concave-rate model; fit $\gamma$ and verify that water-filling emerges only for $\gamma<1$.
+\end{enumerate}
+
+\section{Related work (pointer map)}
+Multi-play and combinatorial bandits\cite{Anantharam1987,Auer2002,GarivierCappe2011,AgrawalGoyal2012}; separable concave resource allocation\cite{IbarakiKatoh1988,BoydVandenberghe2004}; rare-event simulation (cross-entropy, splitting)\cite{RubinsteinKroese2004,GlassermanHeidelbergerShahabuddin1999}; reliability/survival scheduling\cite{Ross2014}. The σ-Safety companion paper provides principled block scales via Doeblin/mixing clocks\cite{MeynTweedie2009}.
+
+\bigskip
+\bibliographystyle{alpha}
+\bibliography{refs}
+
+\appendix
+
+\section{Survival approximation details}
+For target $i$, $T_i=t_i^\star B_i$ with $B_i\sim\mathrm{Geom}(q_i)$. Then for $t\ge 0$,
+\(
+\Pr(T_i>t)=\Pr\!\big(B_i> \lfloor t/t_i^\star\rfloor\big)=(1-q_i)^{\lfloor t/t_i^\star\rfloor}.
+\)
+Since $\lfloor x\rfloor=x+O(1)$,
+\(
+\Pr(T_i>t)=(1-q_i)^{t/t_i^\star+O(1)}=\exp\{-(-\log(1-q_i))t/t_i^\star + O(1)\log (1-q_i)\},
+\)
+and for $q_i\ll 1$ the $O(1)$ term is negligible on scales where $\E[T_i]\gg t_i^\star$.
+
+\section{Sequential policy for $K$ distinct targets}
+At stage $j$, allocate all $M$ threads to the best remaining $c_{(j)}$. The waiting time is exponential with mean $1/(M c_{(j)})$. Memorylessness gives independence across stages (under the approximation). Any policy that reduces the active hazard at a stage increases its expected waiting time; summing yields optimality in expectation.
+
+\section{Block-level inversion}
+If only block-level indicators are observed, let $X_\ell\in\{0,1\}$ indicate whether block $\ell$ with $m_i$ threads succeeded. Then $\hat q_i=\frac{1}{N}\sum_{\ell=1}^N X_\ell$ is unbiased for $q_i(m_i)$. Define $\hat p_i = 1-(1-\hat q_i)^{1/m_i}$; bias is $o(1)$ for large $N$ and small $q_i$. The delta-method variance formula in the main text follows from $g'(q)=(1/m_i)(1-q)^{1/m_i-1}$.
+\end{document}
